@@ -227,6 +227,53 @@ int GetScreenBrightness(void) {
     return -1;
 }
 
+ScreenState GetScreenState(void) {
+    // bramble:/ # dumpsys power | grep -iE 'Display Power: state|mWakefulness|mScreenOn'
+    //   Display Power: state=ON
+    //   mWakefulness=Awake
+    //   mScreenOn=true
+    // "Display Power: state=" is the most reliable on Android 10+; fall back to the wakefulness
+    // and then the legacy boolean for older / OEM ROMs. Anything unrecognized -> kUnknown, so the
+    // caller can degrade to other signals instead of guessing the screen state wrong.
+    std::string buf;
+    ExecCmdSync(&buf, "/system/bin/dumpsys", "power");
+    if (buf.empty()) {
+        return ScreenState::kUnknown;
+    }
+
+    auto valueAfter = [&buf](const char *key) -> const char * {
+        const char *p = strstr(buf.c_str(), key);
+        return p ? p + strlen(key) : nullptr;
+    };
+    auto startsWith = [](const char *s, const char *prefix) { return strncmp(s, prefix, strlen(prefix)) == 0; };
+
+    if (const char *s = valueAfter("Display Power: state=")) {
+        if (startsWith(s, "ON")) {
+            return ScreenState::kOn;
+        }
+        if (startsWith(s, "OFF") || startsWith(s, "DOZE")) {
+            return ScreenState::kOff;
+        }
+    }
+    if (const char *s = valueAfter("mWakefulness=")) {
+        if (startsWith(s, "Awake")) {
+            return ScreenState::kOn;
+        }
+        if (startsWith(s, "Asleep") || startsWith(s, "Dozing")) {
+            return ScreenState::kOff;
+        }
+    }
+    if (const char *s = valueAfter("mScreenOn=")) {
+        if (startsWith(s, "true")) {
+            return ScreenState::kOn;
+        }
+        if (startsWith(s, "false")) {
+            return ScreenState::kOff;
+        }
+    }
+    return ScreenState::kUnknown;
+}
+
 void CallSettingsPut(const char *ns, const char *key, const char *val) {
     ExecCmd(nullptr, "/system/bin/cmd", "settings", "put", ns, key, val);
 }

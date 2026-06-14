@@ -17,8 +17,18 @@
 #pragma once
 
 #include "cobridge_type.h"
+#include "offscreen_policy.h"
 #include "platform/module_base.h"
+#include <mutex>
 
+// OffscreenMonitor is the I/O adapter around the pure OffscreenPolicy. It feeds the policy three
+// signals -- the `restricted` cgroup task count (cgroup.re.list), user input edges (input.touch /
+// input.btn) and the authoritative system screen state (dumpsys, via GetScreenState()) -- and
+// publishes the fused verdict on "offscreen.state" (a bool, the contract DynamicFps consumes).
+//
+// All decision state lives in policy_, guarded by mut_. Each handler decides under the lock, then
+// performs the returned side effects (publish / authoritative query / tick rearm) AFTER releasing
+// it -- CoPublish runs subscribers synchronously, so it must not be called while holding mut_.
 class OffscreenMonitor : public ModuleBase {
 public:
     OffscreenMonitor();
@@ -27,5 +37,13 @@ public:
 
 private:
     void OnRestrictedList(const void *data);
-    bool prevOffscreen_;
+    void OnInput(const void *data);
+    void ScheduleTick(int64_t delayUs);
+    void RunAuthoritativeQuery(void);
+    void Apply(const OffscreenAction &action);
+
+    OffscreenPolicy policy_;
+    std::mutex mut_;
+    HeavyWorker::Handle hw_;
+    DelayedWorker::Handle dwTick_;
 };

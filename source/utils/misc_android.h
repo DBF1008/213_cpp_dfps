@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "screen_state.h"
 #include <string>
 
 int GetOSVersion(void);
@@ -23,6 +24,7 @@ std::string GetTopAppNameDumpsys(void);
 std::string GetHomePackageName(void);
 std::string GetTombstone(int pid);
 int GetScreenBrightness(void);
+ScreenState GetScreenState(void);
 
 void SysPeakRefreshRate(const std::string &hz, bool force);
 void SysSurfaceflingerBackdoor(const std::string &idx, bool force);
