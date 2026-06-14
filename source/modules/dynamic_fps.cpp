@@ -55,13 +55,14 @@ DynamicFps::DynamicFps(const std::string &configPath, const std::string &notifyP
       active_(false),
       lowBrightness_(false),
       isOffscreen_(false),
-      curHz_(INT32_MAX),
       forceSwitch_(false),
       dwInput_(DwCreate(MODULE_NAME)),
       dwGesture_(DwCreate(MODULE_NAME)),
       dwWakeup_(DwCreate(MODULE_NAME)),
       hw_(HwCreate(MODULE_NAME)) {
     LoadConfig(configPath);
+    auto backend = useSfBackdoor_ ? RrBackend::SurfaceflingerBackdoor : RrBackend::PeakRefreshRate;
+    switcher_ = std::make_unique<RefreshRateSwitcher>(backend, MakeAndroidPlatform());
 }
 
 void DynamicFps::Start(void) { AddReactor(); }
@@ -305,17 +306,17 @@ void DynamicFps::SwitchRefreshRate(int hz) {
     auto force = forceSwitch_;
     forceSwitch_ = false;
     SPDLOG_DEBUG("switch {}", hz);
-    if (force == false && hz == curHz_) {
-        return;
-    }
 
-    std::string hzStr = std::to_string(hz);
-    curHz_ = hz;
-    NotifyRefreshRate(hzStr);
-    if (useSfBackdoor_) {
-        SysSurfaceflingerBackdoor(hzStr, force);
+    auto result = switcher_->Switch(hz, force);
+    if (result.changed == false) {
+        return; // already at this rate, nothing to do
+    }
+    if (result.verified) {
+        // Only report the rate downstream once it is confirmed to be in effect,
+        // so the notify file never advertises a switch that silently failed.
+        NotifyRefreshRate(std::to_string(hz));
     } else {
-        SysPeakRefreshRate(hzStr, force);
+        SPDLOG_WARN("Refresh rate {} could not be applied/verified; notify file left unchanged", hz);
     }
 }
 

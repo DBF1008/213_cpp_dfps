@@ -16,9 +16,11 @@
 
 #pragma once
 
+#include "modules/refresh_rate_switcher.h"
 #include "platform/module_base.h"
 #include "utils/time_counter.h"
 #include <map>
+#include <memory>
 #include <string>
 
 class DynamicFps : public ModuleBase {
@@ -71,11 +73,12 @@ private:
     std::string curApp_;
     std::string overridedApp_;
     bool isOffscreen_;
-    int curHz_;
     bool forceSwitch_;
 
     DelayedWorker::Handle dwInput_;
     DelayedWorker::Handle dwGesture_;
     DelayedWorker::Handle dwWakeup_;
     HeavyWorker::Handle hw_;
+
+    std::unique_ptr<RefreshRateSwitcher> switcher_;
 };

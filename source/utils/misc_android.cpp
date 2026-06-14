@@ -15,9 +15,12 @@
  */
 
 #include "misc_android.h"
+#include "modules/refresh_rate_switcher.h"
 #include "utils/misc.h"
+#include "utils/refresh_rate_probe.h"
 #include <cstring>
 #include <dirent.h>
+#include <spdlog/spdlog.h>
 #include <stdlib.h>
 #include <sys/stat.h>
 #include <sys/system_properties.h>
@@ -227,36 +230,117 @@ int GetScreenBrightness(void) {
     return -1;
 }
 
-void CallSettingsPut(const char *ns, const char *key, const char *val) {
-    ExecCmd(nullptr, "/system/bin/cmd", "settings", "put", ns, key, val);
+// --- refresh-rate backends with command-level verification ---------------------
+
+// `cmd settings put`, synchronous, returns the child exit status (0 == ok).
+static int CallSettingsPutSync(const char *ns, const char *key, const char *val) {
+    return ExecCmdSync(nullptr, "/system/bin/cmd", "settings", "put", ns, key, val);
 }
 
-void SyncCallSurfaceflingerBackdoor(const char *code, const char *hz) {
-    ExecCmdSync(nullptr, "/system/bin/service", "call", "SurfaceFlinger", code, "i32", hz);
+// `cmd settings get`, returns the parsed value (false when unset / null / blank).
+static bool GetSettingsValue(const char *ns, const char *key, std::string *out) {
+    std::string buf;
+    ExecCmdSync(&buf, "/system/bin/cmd", "settings", "get", ns, key);
+    return ParseSettingsValue(buf, out);
 }
 
-void SysPeakRefreshRate(const std::string &hz, bool force) {
-    CallSettingsPut("system", "peak_refresh_rate", hz.c_str());
-    CallSettingsPut("system", "min_refresh_rate", hz.c_str());
-    CallSettingsPut("system", "miui_refresh_rate", hz.c_str());
-    CallSettingsPut("secure", "miui_refresh_rate", hz.c_str());
+// `service call SurfaceFlinger <code> i32 <arg>`, returns exit status; captures
+// the printed parcel into `out` when provided.
+static int CallSfBackdoorSync(const char *code, const char *arg, std::string *out) {
+    return ExecCmdSync(out, "/system/bin/service", "call", "SurfaceFlinger", code, "i32", arg);
 }
 
-void SysSurfaceflingerBackdoor(const std::string &idx, bool force) {
-    // >= Android 10
-    // 1035 -1/0/1/2: setActiveConfig
-    SyncCallSurfaceflingerBackdoor("1035", idx.c_str());
+static std::string DumpsysSurfaceFlinger(void) {
+    std::string buf;
+    ExecCmdSync(&buf, "/system/bin/dumpsys", "SurfaceFlinger");
+    return buf;
+}
+
+static std::string DumpsysDisplay(void) {
+    std::string buf;
+    ExecCmdSync(&buf, "/system/bin/dumpsys", "display");
+    return buf;
+}
+
+// The actual current refresh rate (Hz). Tries SurfaceFlinger first, then the
+// DisplayManager dump. Returns <=0 when neither can be parsed.
+static double GetActiveRefreshRate(void) {
+    double hz = ParseActiveRefreshRate(DumpsysSurfaceFlinger());
+    if (hz > 0) {
+        return hz;
+    }
+    return ParseActiveRefreshRate(DumpsysDisplay());
+}
+
+static int GetActiveConfigIndex(void) { return ParseActiveConfigIndex(DumpsysSurfaceFlinger()); }
+
+static std::vector<DisplayMode> GetDisplayModes(void) { return ParseDisplayModes(DumpsysSurfaceFlinger()); }
+
+// Apply peak_refresh_rate, pinning min == peak == hz. The peak/min keys are
+// required; the MIUI keys are best-effort, so a ROM that does not use them never
+// fails the switch. Success means every required key was written and read back.
+static bool ApplyPeakRefreshRate(const std::string &hz, bool /*force*/) {
+    struct Key {
+        const char *ns;
+        const char *key;
+        bool required;
+    };
+    static const Key keys[] = {
+        {"system", "peak_refresh_rate", true},
+        {"system", "min_refresh_rate", true},
+        {"system", "miui_refresh_rate", false},
+        {"secure", "miui_refresh_rate", false},
+    };
+
+    std::vector<SettingPutResult> results;
+    for (const auto &k : keys) {
+        int status = CallSettingsPutSync(k.ns, k.key, hz.c_str());
+        bool accepted = (status == 0);
+        if (accepted && k.required) {
+            // Confirm the required value actually landed in the settings store
+            // (the rate oracle later confirms it took effect on the display).
+            std::string got;
+            accepted = GetSettingsValue(k.ns, k.key, &got) && got == hz;
+        }
+        if (!accepted && !k.required) {
+            SPDLOG_DEBUG("Best-effort setting {}/{} not accepted (ROM may not use it)", k.ns, k.key);
+        }
+        results.push_back({k.required, accepted});
+    }
+    return RequiredSettingsAccepted(results);
+}
+
+// Apply the SurfaceFlinger backdoor setActiveConfig(index).
+//   >= Android 10: 1035 i32 <index>  -- setActiveConfig
+//   >= Android 11 (force): bounce through a frame-rate flexibility token so the
+//                          change actually sticks:
+//     1036 i32 1 : Frame rate flexibility token acquired. count=1
+//     1035 i32 -1: reset
+//     1036 i32 0 : Frame rate flexibility token released. count=0
+//     1035 i32 <index>: re-apply
+static bool ApplySurfaceflingerBackdoor(const std::string &idx, bool force) {
+    std::string out;
+    int status = CallSfBackdoorSync("1035", idx.c_str(), &out);
+    bool ok = (status == 0) && ServiceCallSucceeded(out);
 
     if (force) {
-        // >= Android 11
-        // 1036 1: Frame rate flexibility token acquired. count=1
-        // 1036 0: Frame rate flexibility token released. count=0
-        // service call SurfaceFlinger 1035 i32 -1 -- okay
-        // service call SurfaceFlinger 1036 i32 1
-        // service call SurfaceFlinger 1035 i32 2 -- not working
-        SyncCallSurfaceflingerBackdoor("1036", "1");
-        SyncCallSurfaceflingerBackdoor("1035", "-1");
-        SyncCallSurfaceflingerBackdoor("1036", "0");
-        SyncCallSurfaceflingerBackdoor("1035", idx.c_str());
+        CallSfBackdoorSync("1036", "1", nullptr);
+        CallSfBackdoorSync("1035", "-1", nullptr);
+        CallSfBackdoorSync("1036", "0", nullptr);
+        out.clear();
+        status = CallSfBackdoorSync("1035", idx.c_str(), &out);
+        ok = (status == 0) && ServiceCallSucceeded(out);
     }
+    return ok;
+}
+
+RrPlatform MakeAndroidPlatform(void) {
+    RrPlatform plat;
+    plat.applyPeak = ApplyPeakRefreshRate;
+    plat.applySf = ApplySurfaceflingerBackdoor;
+    plat.queryActiveHz = GetActiveRefreshRate;
+    plat.queryActiveConfigIdx = GetActiveConfigIndex;
+    plat.queryModes = GetDisplayModes;
+    plat.sleepMs = [](int ms) { Sleep(MsToUs(ms)); };
+    return plat;
 }
