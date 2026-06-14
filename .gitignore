@@ -1,3 +1,6 @@
 __pycache__
 /.vscode
 /build
+
+# host unit-test binary built by test/run_tests.sh
+/test/topapp_switch_detector_test

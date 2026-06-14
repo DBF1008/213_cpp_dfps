@@ -29,7 +29,7 @@ public:
 private:
     void OnTopappList(const void *data);
 
-    int topappNr_;
+    PidList prevPids_;
     std::string prevPkgName_;
     HeavyWorker::Handle hw_;
     DelayedWorker::Handle dw_;

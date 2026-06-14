@@ -15,6 +15,7 @@
  */
 
 #include "topapp_monitor.h"
+#include "topapp_switch_detector.h"
 #include "utils/atrace.h"
 #include "utils/misc.h"
 #include "utils/misc_android.h"
@@ -22,9 +23,8 @@
 
 constexpr char MODULE_NAME[] = "TopappMonitor";
 constexpr int64_t TOP_APP_SWITCH_DELAY_MS = 800;
-constexpr size_t TOP_TASK_NR_DIFF_MIN = 10;
 
-TopappMonitor::TopappMonitor() : topappNr_(0), hw_(HwCreate(MODULE_NAME)), dw_(DwCreate(MODULE_NAME)) {}
+TopappMonitor::TopappMonitor() : hw_(HwCreate(MODULE_NAME)), dw_(DwCreate(MODULE_NAME)) {}
 
 TopappMonitor::~TopappMonitor() {}
 
@@ -39,12 +39,24 @@ void TopappMonitor::OnTopappList(const void *data) {
     }
 
     const auto &pl = CoBridge::Get<PidList>(data);
-    auto nr = static_cast<int>(pl.size());
-    if (std::abs(nr - topappNr_) <= TOP_TASK_NR_DIFF_MIN) {
+
+    // Re-query the foreground package whenever the top-app task set looks like it
+    // now belongs to a different app. TopappTasksChanged() combines a thread-count
+    // delta with task-set churn, so an app<->app switch (as well as a launcher
+    // switch or a gesture-back to another app) is caught even when the two
+    // foregrounds have a similar number of threads -- the case the old count-only
+    // check let slip through, leaving per-app rules stuck on the stale package.
+    if (TopappTasksChanged(prevPids_, pl) == false) {
         return;
     }
-    topappNr_ = nr;
+    // Anchor future churn comparisons to this accepted snapshot. Comparing
+    // against the last accepted set (rather than the immediately previous one)
+    // also accumulates slow, piecemeal task replacement into an eventual switch.
+    prevPids_ = pl;
 
+    // A switch emits a burst of cgroup updates in quick succession; DwSetWork
+    // keeps only the most recent, so the heavy dumpsys runs ~once per quiet
+    // window, and the prevPkgName_ guard suppresses redundant publishes.
     auto delayed = [this]() {
         auto heavywork = [this]() {
             ATRACE_SCOPE(GetTopAppName);
