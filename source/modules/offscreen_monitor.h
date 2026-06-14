@@ -17,15 +17,42 @@
 #pragma once
 
 #include "cobridge_type.h"
+#include "kernel_state_reader.h"
+#include "offscreen_state_fusion.h"
 #include "platform/module_base.h"
+#include <mutex>
 
 class OffscreenMonitor : public ModuleBase {
 public:
-    OffscreenMonitor();
-    ~OffscreenMonitor();
+    OffscreenMonitor(void);
+    ~OffscreenMonitor(void);
     void Start(void) override;
 
 private:
+    // CoBridge subscription handlers (called from different threads)
     void OnRestrictedList(const void *data);
+    void OnTouchState(const void *data);
+    void OnButtonState(const void *data);
+
+    // Kernel display state polling
+    void OnKernelPoll(void);
+    void ScheduleKernelPoll(void);
+
+    // Evaluate fusion engine and publish if state changed
+    void EvaluateAndPublish(void);
+
+    OffscreenStateFusion engine_;
+    KernelStateReader kernelReader_;
+
+    // Cached signal snapshot — updated by each callback under lock
+    FusionSignals signals_;
+
+    // Previous published state for edge detection
     bool prevOffscreen_;
+
+    // Serializes access to engine_ and signals_ across CoBridge callback threads
+    std::mutex mutex_;
+
+    // DelayedWorker handle for periodic kernel state polling
+    DelayedWorker::Handle dwKernelPoll_;
 };

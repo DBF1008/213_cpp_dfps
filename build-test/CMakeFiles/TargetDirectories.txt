@@ -1,0 +1,4 @@
+/Users/dongbufan/work/ai_color/one_claude_project/success/213_cpp_dfps/prompt/p5/p5-qwen-3.7-max/build-test/CMakeFiles/dfps_tests.dir
+/Users/dongbufan/work/ai_color/one_claude_project/success/213_cpp_dfps/prompt/p5/p5-qwen-3.7-max/build-test/CMakeFiles/test.dir
+/Users/dongbufan/work/ai_color/one_claude_project/success/213_cpp_dfps/prompt/p5/p5-qwen-3.7-max/build-test/CMakeFiles/edit_cache.dir
+/Users/dongbufan/work/ai_color/one_claude_project/success/213_cpp_dfps/prompt/p5/p5-qwen-3.7-max/build-test/CMakeFiles/rebuild_cache.dir
