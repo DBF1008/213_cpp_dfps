@@ -20,6 +20,8 @@
 
 int GetOSVersion(void);
 std::string GetTopAppNameDumpsys(void);
+std::string GetTopAppNameProcfs(int pid);
+std::string ExtractPkgNameFromCmdline(const std::string &cmdline);
 std::string GetHomePackageName(void);
 std::string GetTombstone(int pid);
 int GetScreenBrightness(void);

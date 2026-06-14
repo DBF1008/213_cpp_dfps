@@ -46,3 +46,30 @@ endif()
 
 target_compile_options(dfps PRIVATE ${THIS_COMPILE_FLAGS} -D_GNU_SOURCE)
 target_link_options(dfps PRIVATE ${THIS_LINK_FLAGS})
+
+# --- Test target (host-side, optional) ---
+option(BUILD_TESTS "Build unit tests for host" OFF)
+if(BUILD_TESTS)
+    include(FetchContent)
+    FetchContent_Declare(
+        googletest
+        GIT_REPOSITORY https://github.com/google/googletest.git
+        GIT_TAG        v1.14.0
+    )
+    set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+    FetchContent_MakeAvailable(googletest)
+
+    enable_testing()
+
+    add_executable(dfps_tests
+        tests/test_topapp_detection.cpp
+        tests/misc_stub.cpp
+        utils/misc_android.cpp
+    )
+    target_include_directories(dfps_tests PRIVATE ${INCS})
+    target_link_libraries(dfps_tests PRIVATE GTest::gtest_main spdlog)
+    target_compile_options(dfps_tests PRIVATE -Wall -Werror -D_GNU_SOURCE)
+
+    include(GoogleTest)
+    gtest_discover_tests(dfps_tests)
+endif()

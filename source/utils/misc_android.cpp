@@ -16,15 +16,19 @@
 
 #include "misc_android.h"
 #include "utils/misc.h"
+#include <cstdio>
 #include <cstring>
 #include <dirent.h>
 #include <stdlib.h>
 #include <sys/stat.h>
+#ifdef __ANDROID__
 #include <sys/system_properties.h>
+#endif
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
 
+#ifdef __ANDROID__
 static int androidOsVersion;
 
 int GetOSVersion(void) {
@@ -113,7 +117,75 @@ std::string GetTopAppNameDumpsys(void) {
     }
     return {};
 }
+#endif // __ANDROID__
 
+// Portable: pure function, no platform dependencies
+std::string ExtractPkgNameFromCmdline(const std::string &cmdline) {
+    // /proc/pid/cmdline contains null-separated args.
+    // For Zygote-spawned Java apps, the first segment IS the package name
+    // (e.g., "com.tencent.mm\0-extra-flag\0").
+    if (cmdline.empty()) {
+        return {};
+    }
+
+    // Take only the first null-terminated segment (the executable name)
+    auto end = cmdline.find('\0');
+    std::string name = (end != std::string::npos) ? cmdline.substr(0, end) : cmdline;
+
+    // Trim trailing whitespace/newlines that some kernels append
+    while (!name.empty() && (name.back() == '\n' || name.back() == '\r' || name.back() == ' ')) {
+        name.pop_back();
+    }
+
+    if (name.empty()) {
+        return {};
+    }
+
+    // Reject native binaries: they contain '/' (e.g., "/system/bin/surfaceflinger")
+    if (name.find('/') != std::string::npos) {
+        return {};
+    }
+
+    // Must contain at least one '.' to be a Java package name.
+    // Rejects bare names like "zygote", "system_server", "adbd".
+    if (name.find('.') == std::string::npos) {
+        return {};
+    }
+
+    // Reject strings starting with '.' (malformed)
+    if (name.front() == '.') {
+        return {};
+    }
+
+    // Strip sub-process suffix at ':' boundary, consistent with dumpsys parsing.
+    // e.g. "com.tencent.mm:toolsmp" → "com.tencent.mm"
+    auto colon = name.find(':');
+    if (colon != std::string::npos) {
+        name = name.substr(0, colon);
+    }
+
+    return name;
+}
+
+std::string GetTopAppNameProcfs(int pid) {
+    if (pid <= 0) {
+        return {};
+    }
+
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
+
+    std::string buf;
+    // cmdline is typically < 256 bytes; 512 is generous
+    auto len = ReadFile(std::string_view(path), &buf, 512);
+    if (len <= 0) {
+        return {};
+    }
+
+    return ExtractPkgNameFromCmdline(buf);
+}
+
+#ifdef __ANDROID__
 std::string GetHomePackageName(void) {
     // Android 7+
     // /system/bin/cmd package resolve-activity -a android.intent.action.MAIN -c android.intent.category.HOME
@@ -260,3 +332,4 @@ void SysSurfaceflingerBackdoor(const std::string &idx, bool force) {
         SyncCallSurfaceflingerBackdoor("1035", idx.c_str());
     }
 }
+#endif // __ANDROID__
