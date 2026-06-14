@@ -15,16 +15,20 @@
  */
 
 #include "misc.h"
+#include <cerrno>
 #include <chrono>
 #include <cstring>
 #include <fcntl.h>
-#include <scn/scn.h>
 #include <signal.h>
-#include <spdlog/spdlog.h>
-#include <sys/prctl.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+#if defined(__linux__)
+#include <sys/prctl.h>
+#elif defined(__APPLE__)
+#include <pthread.h>
+#endif
 
 int64_t GetNowTs(void) {
     auto ns = std::chrono::steady_clock::time_point::clock().now().time_since_epoch();
@@ -114,7 +118,15 @@ void SetSelfName(const std::string_view &name) {
     SetSelfThreadName(name);
 }
 
-void SetSelfThreadName(const std::string_view &name) { prctl(PR_SET_NAME, name.data()); }
+void SetSelfThreadName(const std::string_view &name) {
+#if defined(__linux__)
+    prctl(PR_SET_NAME, name.data());
+#elif defined(__APPLE__)
+    pthread_setname_np(name.data());
+#else
+    (void)name;
+#endif
+}
 
 constexpr int READER_FD_FLAGS = O_RDONLY | O_NONBLOCK | O_CLOEXEC;
 constexpr int WRITER_FD_FLAGS = O_WRONLY | O_NONBLOCK | O_CLOEXEC;
@@ -224,13 +236,32 @@ int GetFdForWriteExcluded(const std::string_view &path) {
     return fd;
 }
 
+// Create a pipe with both ends marked close-on-exec. Uses pipe2() on Linux/Android; falls
+// back to pipe()+fcntl() elsewhere so the exec path can be built and tested on a host that
+// lacks pipe2() (e.g. macOS). The Linux/Android code path is unchanged.
+static int MakeCloexecPipe(int pipefd[2]) {
+#if defined(__linux__)
+    return pipe2(pipefd, O_CLOEXEC);
+#else
+    if (pipe(pipefd) == -1) {
+        return -1;
+    }
+    if (fcntl(pipefd[0], F_SETFD, FD_CLOEXEC) == -1 || fcntl(pipefd[1], F_SETFD, FD_CLOEXEC) == -1) {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        return -1;
+    }
+    return 0;
+#endif
+}
+
 int ExecCmd(int *fd, const char **argv) {
     int pipefd[] = {-1, -1};
     auto &parentFd = pipefd[0];
     auto &childFd = pipefd[1];
 
     if (fd) {
-        if (pipe2(pipefd, O_CLOEXEC) == -1) {
+        if (MakeCloexecPipe(pipefd) == -1) {
             return -1;
         }
     }
@@ -270,19 +301,29 @@ int ExecCmdSync(std::string *content, const char **argv) {
         return -1;
     }
 
-    int status;
-    waitpid(pid, &status, 0);
-    status = WEXITSTATUS(status);
-
+    // Drain the child's output BEFORE reaping it. Reaping first (waitpid) would deadlock
+    // whenever the child writes more than the pipe buffer can hold: the child blocks in
+    // write() waiting for the pipe to be drained, while we block in waitpid() waiting for
+    // the child to exit. Reading until EOF (every write end of the pipe closed, which
+    // happens when the child exits or closes stdout/stderr) keeps the pipe flowing, so the
+    // child can finish and waitpid() then returns promptly.
     if (content) {
         constexpr size_t READ_BATCH_SIZE = 4096;
-        int len = 0;
-        int l = 0;
+        size_t len = 0;
         content->clear();
-        do {
-            len += l;
+        for (;;) {
             content->resize(len + READ_BATCH_SIZE);
-        } while ((l = read(fd, content->data() + len, READ_BATCH_SIZE)) > 0);
+            ssize_t l = read(fd, content->data() + len, READ_BATCH_SIZE);
+            if (l > 0) {
+                len += static_cast<size_t>(l);
+            } else if (l == 0) {
+                break; // EOF: all write ends closed
+            } else if (errno == EINTR) {
+                continue; // interrupted by a signal, retry the read
+            } else {
+                break; // unrecoverable read error
+            }
+        }
         close(fd);
 
         if (len > 0) {
@@ -293,5 +334,11 @@ int ExecCmdSync(std::string *content, const char **argv) {
         }
     }
 
-    return status;
+    int status = 0;
+    while (waitpid(pid, &status, 0) == -1) {
+        if (errno != EINTR) {
+            break; // child already reaped or unwaitable; fall through with status 0
+        }
+    }
+    return WEXITSTATUS(status);
 }
