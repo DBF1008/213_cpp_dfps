@@ -57,6 +57,8 @@ DynamicFps::DynamicFps(const std::string &configPath, const std::string &notifyP
       isOffscreen_(false),
       curHz_(INT32_MAX),
       forceSwitch_(false),
+      useFallback_(false),
+      consecutiveFailures_(0),
       dwInput_(DwCreate(MODULE_NAME)),
       dwGesture_(DwCreate(MODULE_NAME)),
       dwWakeup_(DwCreate(MODULE_NAME)),
@@ -101,6 +103,7 @@ void DynamicFps::LoadConfig(const std::string &configPath) {
     }
 
     fclose(fp);
+    InitBackends();
 }
 
 void DynamicFps::ParseLine(const std::string &line) {
@@ -281,6 +284,61 @@ void DynamicFps::OnOffscreen(const void *data) {
     }
 }
 
+void DynamicFps::InitBackends(void) {
+    if (useSfBackdoor_) {
+        primaryBackend_ = SysSurfaceflingerBackdoor;
+        primaryBackendName_ = "SurfaceFlinger backdoor";
+        fallbackBackend_ = SysPeakRefreshRate;
+        fallbackBackendName_ = "peak_refresh_rate";
+    } else {
+        primaryBackend_ = SysPeakRefreshRate;
+        primaryBackendName_ = "peak_refresh_rate";
+        fallbackBackend_ = SysSurfaceflingerBackdoor;
+        fallbackBackendName_ = "SurfaceFlinger backdoor";
+    }
+
+    bool primaryOk = false;
+    bool fallbackOk = false;
+
+    if (useSfBackdoor_) {
+        primaryOk = ProbeSurfaceflingerBackdoor();
+        fallbackOk = ProbePeakRefreshRateBackend();
+    } else {
+        primaryOk = ProbePeakRefreshRateBackend();
+        fallbackOk = ProbeSurfaceflingerBackdoor();
+    }
+
+    if (primaryOk) {
+        SPDLOG_INFO("Primary backend '{}' is available", primaryBackendName_);
+    } else {
+        SPDLOG_WARN("Primary backend '{}' probe failed", primaryBackendName_);
+    }
+
+    if (fallbackOk) {
+        SPDLOG_INFO("Fallback backend '{}' is available", fallbackBackendName_);
+    } else {
+        SPDLOG_WARN("Fallback backend '{}' probe failed", fallbackBackendName_);
+    }
+
+    // If primary is unavailable but fallback is, switch to fallback immediately
+    if (!primaryOk && fallbackOk) {
+        SPDLOG_INFO("Primary backend unavailable, starting with '{}' instead", fallbackBackendName_);
+        std::swap(primaryBackend_, fallbackBackend_);
+        std::swap(primaryBackendName_, fallbackBackendName_);
+        useFallback_ = false;
+    }
+}
+
+bool DynamicFps::TryBackend(const BackendSwitchFn &backend, const std::string &name,
+                            const std::string &hz, bool force) {
+    try {
+        return backend(hz, force);
+    } catch (...) {
+        SPDLOG_ERROR("Backend '{}' threw exception for hz={}", name, hz);
+        return false;
+    }
+}
+
 void DynamicFps::SwitchRefreshRate(bool force) {
     forceSwitch_ = force;
     if (active_) {
@@ -310,13 +368,41 @@ void DynamicFps::SwitchRefreshRate(int hz) {
     }
 
     std::string hzStr = std::to_string(hz);
-    curHz_ = hz;
-    NotifyRefreshRate(hzStr);
-    if (useSfBackdoor_) {
-        SysSurfaceflingerBackdoor(hzStr, force);
-    } else {
-        SysPeakRefreshRate(hzStr, force);
+
+    // Pick the active backend
+    auto &activeBackend = useFallback_ ? fallbackBackend_ : primaryBackend_;
+    auto &activeName = useFallback_ ? fallbackBackendName_ : primaryBackendName_;
+    auto &otherBackend = useFallback_ ? primaryBackend_ : fallbackBackend_;
+    auto &otherName = useFallback_ ? primaryBackendName_ : fallbackBackendName_;
+
+    // Try the active backend
+    bool success = TryBackend(activeBackend, activeName, hzStr, force);
+    if (success) {
+        consecutiveFailures_ = 0;
+        curHz_ = hz;
+        NotifyRefreshRate(hzStr);
+        return;
     }
+
+    // Active backend failed — try the other one
+    consecutiveFailures_++;
+    SPDLOG_WARN("Backend '{}' failed for hz={}, consecutive failures={}",
+                activeName, hz, consecutiveFailures_);
+
+    success = TryBackend(otherBackend, otherName, hzStr, force);
+    if (success) {
+        // Permanently switch to the other backend
+        useFallback_ = !useFallback_;
+        consecutiveFailures_ = 0;
+        curHz_ = hz;
+        NotifyRefreshRate(hzStr);
+        SPDLOG_INFO("Permanently switched to '{}' after '{}' failure",
+                    otherName, activeName);
+        return;
+    }
+
+    // Both backends failed — do NOT update curHz_ or notify file
+    SPDLOG_ERROR("Both backends failed for hz={}, keeping curHz_={}", hz, curHz_);
 }
 
 void DynamicFps::NotifyRefreshRate(const std::string_view &hz) {

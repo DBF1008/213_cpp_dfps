@@ -227,36 +227,81 @@ int GetScreenBrightness(void) {
     return -1;
 }
 
-void CallSettingsPut(const char *ns, const char *key, const char *val) {
-    ExecCmd(nullptr, "/system/bin/cmd", "settings", "put", ns, key, val);
+bool CallSettingsPut(const char *ns, const char *key, const char *val) {
+    int status = ExecCmdSync(nullptr, "/system/bin/cmd", "settings", "put", ns, key, val);
+    return status == 0;
 }
 
-void SyncCallSurfaceflingerBackdoor(const char *code, const char *hz) {
-    ExecCmdSync(nullptr, "/system/bin/service", "call", "SurfaceFlinger", code, "i32", hz);
+std::string CallSettingsGet(const char *ns, const char *key) {
+    std::string buf;
+    int status = ExecCmdSync(&buf, "/system/bin/cmd", "settings", "get", ns, key);
+    if (status != 0 || buf.empty()) {
+        return {};
+    }
+    // trim trailing whitespace
+    while (!buf.empty() && (buf.back() == '\n' || buf.back() == '\r' || buf.back() == ' ')) {
+        buf.pop_back();
+    }
+    return buf;
 }
 
-void SysPeakRefreshRate(const std::string &hz, bool force) {
-    CallSettingsPut("system", "peak_refresh_rate", hz.c_str());
-    CallSettingsPut("system", "min_refresh_rate", hz.c_str());
-    CallSettingsPut("system", "miui_refresh_rate", hz.c_str());
-    CallSettingsPut("secure", "miui_refresh_rate", hz.c_str());
+bool SyncCallSurfaceflingerBackdoor(const char *code, const char *hz) {
+    std::string buf;
+    int status = ExecCmdSync(&buf, "/system/bin/service", "call", "SurfaceFlinger", code, "i32", hz);
+    if (status != 0) {
+        return false;
+    }
+    // Check for error parcel codes in output:
+    // fffffff6 = BAD_VALUE, fffffffd = NAME_NOT_FOUND, fffffffe = PERMISSION_DENIED
+    if (buf.find("fffffff6") != std::string::npos ||
+        buf.find("fffffffd") != std::string::npos ||
+        buf.find("fffffffe") != std::string::npos) {
+        return false;
+    }
+    return true;
 }
 
-void SysSurfaceflingerBackdoor(const std::string &idx, bool force) {
-    // >= Android 10
-    // 1035 -1/0/1/2: setActiveConfig
-    SyncCallSurfaceflingerBackdoor("1035", idx.c_str());
+bool SysPeakRefreshRate(const std::string &hz, bool force) {
+    bool ok = true;
+    ok &= CallSettingsPut("system", "peak_refresh_rate", hz.c_str());
+    ok &= CallSettingsPut("system", "min_refresh_rate", hz.c_str());
+    ok &= CallSettingsPut("system", "miui_refresh_rate", hz.c_str());
+    ok &= CallSettingsPut("secure", "miui_refresh_rate", hz.c_str());
+    if (!ok) {
+        return false;
+    }
+    // Verify by reading back the primary setting
+    std::string readBack = CallSettingsGet("system", "peak_refresh_rate");
+    return !readBack.empty() && readBack != "null" && readBack == hz;
+}
+
+bool SysSurfaceflingerBackdoor(const std::string &idx, bool force) {
+    bool ok = SyncCallSurfaceflingerBackdoor("1035", idx.c_str());
+    if (!ok) {
+        return false;
+    }
 
     if (force) {
-        // >= Android 11
-        // 1036 1: Frame rate flexibility token acquired. count=1
-        // 1036 0: Frame rate flexibility token released. count=0
-        // service call SurfaceFlinger 1035 i32 -1 -- okay
-        // service call SurfaceFlinger 1036 i32 1
-        // service call SurfaceFlinger 1035 i32 2 -- not working
-        SyncCallSurfaceflingerBackdoor("1036", "1");
-        SyncCallSurfaceflingerBackdoor("1035", "-1");
-        SyncCallSurfaceflingerBackdoor("1036", "0");
-        SyncCallSurfaceflingerBackdoor("1035", idx.c_str());
+        ok &= SyncCallSurfaceflingerBackdoor("1036", "1");
+        ok &= SyncCallSurfaceflingerBackdoor("1035", "-1");
+        ok &= SyncCallSurfaceflingerBackdoor("1036", "0");
+        ok &= SyncCallSurfaceflingerBackdoor("1035", idx.c_str());
+        if (!ok) {
+            return false;
+        }
     }
+    return true;
+}
+
+bool ProbePeakRefreshRateBackend(void) {
+    std::string val = CallSettingsGet("system", "peak_refresh_rate");
+    // If we get a non-empty, non-"null" response, the backend is available
+    return !val.empty() && val != "null";
+}
+
+bool ProbeSurfaceflingerBackdoor(void) {
+    std::string buf;
+    int status = ExecCmdSync(&buf, "/system/bin/service", "check", "SurfaceFlinger");
+    // service check returns 0 and prints "Service SurfaceFlinger is found" on success
+    return status == 0 && buf.find("found") != std::string::npos;
 }

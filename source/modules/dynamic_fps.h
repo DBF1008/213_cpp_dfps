@@ -18,10 +18,13 @@
 
 #include "platform/module_base.h"
 #include "utils/time_counter.h"
+#include <functional>
 #include <map>
 #include <string>
 
 class DynamicFps : public ModuleBase {
+    friend class DynamicFpsFallbackTest;
+
 public:
     DynamicFps(const std::string &configPath, const std::string &notifyPath);
     void Start(void);
@@ -51,6 +54,10 @@ private:
     void SwitchRefreshRate(int hz);
     void NotifyRefreshRate(const std::string_view &hz);
 
+    using BackendSwitchFn = std::function<bool(const std::string &, bool)>;
+    void InitBackends(void);
+    bool TryBackend(const BackendSwitchFn &backend, const std::string &name, const std::string &hz, bool force);
+
     bool useSfBackdoor_;
     int64_t touchSlackMs_;
     int64_t gestureSlackMs_;
@@ -73,6 +80,13 @@ private:
     bool isOffscreen_;
     int curHz_;
     bool forceSwitch_;
+
+    BackendSwitchFn primaryBackend_;
+    BackendSwitchFn fallbackBackend_;
+    std::string primaryBackendName_;
+    std::string fallbackBackendName_;
+    bool useFallback_;
+    int consecutiveFailures_;
 
     DelayedWorker::Handle dwInput_;
     DelayedWorker::Handle dwGesture_;

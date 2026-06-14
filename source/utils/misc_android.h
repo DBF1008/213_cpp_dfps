@@ -24,5 +24,7 @@ std::string GetHomePackageName(void);
 std::string GetTombstone(int pid);
 int GetScreenBrightness(void);
 
-void SysPeakRefreshRate(const std::string &hz, bool force);
-void SysSurfaceflingerBackdoor(const std::string &idx, bool force);
+bool SysPeakRefreshRate(const std::string &hz, bool force);
+bool SysSurfaceflingerBackdoor(const std::string &idx, bool force);
+bool ProbePeakRefreshRateBackend(void);
+bool ProbeSurfaceflingerBackdoor(void);
