@@ -20,6 +20,7 @@
 #include "utils/time_counter.h"
 #include <map>
 #include <string>
+#include <vector>
 
 class DynamicFps : public ModuleBase {
 public:
@@ -33,10 +34,10 @@ private:
     };
 
     void LoadConfig(const std::string &configPath);
-    void ParseLine(const std::string &line);
+    void ParseLine(const std::string &line, int lineNo, std::vector<std::string> &errors);
     void AddRule(const std::string &pkgName, FpsRule rule);
-    void SetTunable(const std::string &tunable, const std::string &value);
-    std::string FindInvalidRule(void);
+    void SetTunable(const std::string &tunable, const std::string &value, int lineNo, std::vector<std::string> &errors);
+    void CollectInvalidRules(std::vector<std::string> &errors) const;
     FpsRule GetCurrentRule(void) const;
 
     void AddReactor(void);
@@ -61,6 +62,8 @@ private:
     FpsRule universial_;
     bool hasUniversial_;
     bool hasOffscreen_;
+    bool sawUniversialLine_;
+    bool sawOffscreenLine_;
     std::string notifyPath_;
 
     bool touchPressed_;

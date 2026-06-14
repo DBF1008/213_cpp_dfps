@@ -21,6 +21,13 @@
 #include "utils/misc_android.h"
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
+#include <charconv>
+#include <cstdio>
+#include <memory>
+#include <system_error>
+#include <vector>
+
 constexpr char MODULE_NAME[] = "DynamicFps";
 constexpr int64_t DEFAULT_GESTURE_SLACK_MS = 4000;
 constexpr int64_t DEFAULT_TOUCH_SLACK_MS = 4000;
@@ -42,6 +49,33 @@ std::string Trim(const std::string &str) {
     return str.substr(first, last - first + 1);
 }
 
+// Strict, non-throwing integer parse: the whole token must be a valid, in-range int.
+// On failure returns false and fills *reason with a short, human-readable cause.
+static bool ParseStrictInt(const std::string &tok, int *out, std::string *reason) {
+    if (tok.empty()) {
+        *reason = "empty value";
+        return false;
+    }
+    int value = 0;
+    const char *first = tok.data();
+    const char *last = tok.data() + tok.size();
+    auto [ptr, ec] = std::from_chars(first, last, value);
+    if (ec == std::errc::invalid_argument) {
+        *reason = "not an integer";
+        return false;
+    }
+    if (ec == std::errc::result_out_of_range) {
+        *reason = "value out of range";
+        return false;
+    }
+    if (ptr != last) {
+        *reason = "trailing characters";
+        return false;
+    }
+    *out = value;
+    return true;
+}
+
 DynamicFps::DynamicFps(const std::string &configPath, const std::string &notifyPath)
     : useSfBackdoor_(DEFAULT_USE_SF_BACKDOOR),
       touchSlackMs_(DEFAULT_TOUCH_SLACK_MS),
@@ -49,6 +83,8 @@ DynamicFps::DynamicFps(const std::string &configPath, const std::string &notifyP
       enableMinBrightness_(DEFAULT_ENABLE_MIN_BRIGHTNESS),
       hasUniversial_(false),
       hasOffscreen_(false),
+      sawUniversialLine_(false),
+      sawOffscreenLine_(false),
       notifyPath_(notifyPath),
       touchPressed_(false),
       btnPressed_(false),
@@ -67,31 +103,39 @@ DynamicFps::DynamicFps(const std::string &configPath, const std::string &notifyP
 void DynamicFps::Start(void) { AddReactor(); }
 
 void DynamicFps::LoadConfig(const std::string &configPath) {
-    FILE *fp = fopen(configPath.c_str(), "re");
-    if (fp == NULL) {
+    std::unique_ptr<FILE, int (*)(FILE *)> fp(fopen(configPath.c_str(), "re"), fclose);
+    if (fp == nullptr) {
         throw FmtException("Cannot open config '{}'", configPath);
     }
 
+    // Validate the whole file first, accumulating every problem so a single bad value cannot
+    // take down the service via an opaque exception, and so the user can fix all mistakes at once.
+    std::vector<std::string> errors;
     char buf[256];
-    while (feof(fp) == false) {
-        buf[0] = '\0';
-        fgets(buf, sizeof(buf), fp);
+    int lineNo = 0;
+    while (fgets(buf, sizeof(buf), fp.get()) != nullptr) {
+        ++lineNo;
         auto line = Trim(buf);
-        ParseLine(line);
+        ParseLine(line, lineNo, errors);
     }
 
-    if (hasOffscreen_ == false) {
-        fclose(fp);
-        throw FmtException("Offscreen rule not specified in the config file");
+    if (sawOffscreenLine_ == false) {
+        errors.emplace_back("missing offscreen rule '-' (e.g. '- -1 -1')");
     }
-    if (hasUniversial_ == false) {
-        fclose(fp);
-        throw FmtException("Default rule not specified in the config file");
+    if (sawUniversialLine_ == false) {
+        errors.emplace_back("missing default rule '*' (e.g. '* 60 120')");
     }
-    auto invalidRuleName = FindInvalidRule();
-    if (invalidRuleName.empty() == false) {
-        fclose(fp);
-        throw FmtException("Rule of '{}' is invalid", invalidRuleName);
+    CollectInvalidRules(errors);
+
+    if (errors.empty() == false) {
+        // Pass the dynamic text as an argument (never as the format string) so a stray '{' in a
+        // package name or raw line cannot break formatting.
+        std::string msg = fmt::format("Invalid config '{}' ({} problem(s)):", configPath, errors.size());
+        for (const auto &e : errors) {
+            msg += "\n  - ";
+            msg += e;
+        }
+        throw FmtException("{}", msg);
     }
 
     if (useSfBackdoor_) {
@@ -99,37 +143,66 @@ void DynamicFps::LoadConfig(const std::string &configPath) {
     } else {
         SPDLOG_INFO("Use PEAK_REFRESH_RATE to switch refresh rate");
     }
-
-    fclose(fp);
 }
 
-void DynamicFps::ParseLine(const std::string &line) {
+void DynamicFps::ParseLine(const std::string &line, int lineNo, std::vector<std::string> &errors) {
     auto isComment = [](const std::string &line) { return line[0] == '#'; };
     auto isTunable = [](const std::string &line) { return line[0] == '/'; };
 
-    char name[256];
-    char value[256];
-    name[0] = '\0';
-    value[0] = '\0';
-
     if (line.empty() || isComment(line)) {
         return;
-    } else if (isTunable(line)) {
+    }
+
+    char name[256];
+    name[0] = '\0';
+
+    if (isTunable(line)) {
         // /touchSlackMs 4000
-        if (sscanf(line.c_str(), "/%s %s", name, value) == 2) {
+        char value[256];
+        value[0] = '\0';
+        if (sscanf(line.c_str(), "/%255s %255s", name, value) == 2) {
             SPDLOG_DEBUG("Set '{}'={}", name, value);
-            SetTunable(name, value);
+            SetTunable(name, value, lineNo, errors);
         } else {
-            SPDLOG_WARN("Skipped broken line '{}'", line);
+            errors.push_back(fmt::format("line {}: malformed tunable '{}' (expected '/<name> <value>')", lineNo, line));
         }
     } else {
         // com.example.app 60 120
         // com.example.app 2 0
+        char idleStr[256];
+        char activeStr[256];
+        idleStr[0] = '\0';
+        activeStr[0] = '\0';
+        if (sscanf(line.c_str(), "%255s %255s %255s", name, idleStr, activeStr) != 3) {
+            errors.push_back(
+                fmt::format("line {}: malformed rule '{}' (expected '<pkgName> <idle> <active>')", lineNo, line));
+            return;
+        }
+
+        std::string pkgName = name;
+        // Record that a line for this special rule was seen (even if its fields are malformed) so a
+        // present-but-broken default/offscreen rule reports its field error only, not also "missing".
+        if (pkgName == UNIVERSIAL_PKG_NAME) {
+            sawUniversialLine_ = true;
+        } else if (pkgName == OFFSCREEN_PKG_NAME) {
+            sawOffscreenLine_ = true;
+        }
+
         FpsRule rule;
-        if (sscanf(line.c_str(), "%s %d %d", name, &rule.idle, &rule.active) == 3) {
-            AddRule(name, rule);
-        } else {
-            SPDLOG_WARN("Skipped broken line '{}'", line);
+        std::string reason;
+        bool valid = true;
+        if (ParseStrictInt(idleStr, &rule.idle, &reason) == false) {
+            errors.push_back(
+                fmt::format("line {}: rule '{}' has invalid idle value '{}' ({})", lineNo, pkgName, idleStr, reason));
+            valid = false;
+        }
+        if (ParseStrictInt(activeStr, &rule.active, &reason) == false) {
+            errors.push_back(fmt::format("line {}: rule '{}' has invalid active value '{}' ({})", lineNo, pkgName,
+                                         activeStr, reason));
+            valid = false;
+        }
+        if (valid) {
+            AddRule(pkgName, rule);
         }
     }
 }
@@ -149,38 +222,61 @@ void DynamicFps::AddRule(const std::string &pkgName, FpsRule rule) {
     }
 }
 
-void DynamicFps::SetTunable(const std::string &tunable, const std::string &value) {
+void DynamicFps::SetTunable(const std::string &tunable, const std::string &value, int lineNo,
+                            std::vector<std::string> &errors) {
+    // Parse without throwing; on a bad value record a locatable error and keep the default.
+    auto parse = [&](int *out) {
+        std::string reason;
+        if (ParseStrictInt(value, out, &reason)) {
+            return true;
+        }
+        errors.push_back(
+            fmt::format("line {}: tunable '{}' has invalid value '{}' ({})", lineNo, tunable, value, reason));
+        return false;
+    };
+
+    int parsed = 0;
     if (tunable == "useSfBackdoor") {
-        useSfBackdoor_ = (std::stoi(value) > 0) ? true : false;
+        if (parse(&parsed)) {
+            useSfBackdoor_ = (parsed > 0) ? true : false;
+        }
     } else if (tunable == "touchSlackMs") {
-        touchSlackMs_ = std::max(MIN_TOUCH_SLACK_MS, std::stoi(value));
+        if (parse(&parsed)) {
+            touchSlackMs_ = std::max(MIN_TOUCH_SLACK_MS, parsed);
+        }
     } else if (tunable == "enableMinBrightness") {
-        enableMinBrightness_ = std::min(MAX_ENABLE_MIN_BRIGHTNESS, std::stoi(value));
+        if (parse(&parsed)) {
+            enableMinBrightness_ = std::min(MAX_ENABLE_MIN_BRIGHTNESS, parsed);
+        }
     } else {
-        SPDLOG_WARN("Unknown tunable '{}' in the config file", tunable);
+        errors.push_back(fmt::format("line {}: unknown tunable '{}'", lineNo, tunable));
     }
 }
 
-std::string DynamicFps::FindInvalidRule(void) {
+void DynamicFps::CollectInvalidRules(std::vector<std::string> &errors) const {
     auto isDefaultRule = [](const FpsRule &rule) { return rule.idle == -1 && rule.active == -1; };
     auto isSfBackdoorRule = [](const FpsRule &rule) { return rule.idle < 20 && rule.active < 20; };
     auto isInvalid = [=](const FpsRule &rule) {
         return isDefaultRule(rule) == false && useSfBackdoor_ != isSfBackdoorRule(rule);
     };
+    auto describe = [this](const std::string &name, const FpsRule &rule) {
+        const char *expected = useSfBackdoor_ ? "expected Surfaceflinger backdoor indices (< 20)"
+                                              : "expected PEAK_REFRESH_RATE values (>= 20)";
+        return fmt::format("rule '{}' (idle={}, active={}) is incompatible with useSfBackdoor={}: {}", name, rule.idle,
+                           rule.active, useSfBackdoor_ ? 1 : 0, expected);
+    };
 
-    if (isInvalid(offscreen_)) {
-        return "offscreen";
+    if (hasOffscreen_ && isInvalid(offscreen_)) {
+        errors.push_back(describe("offscreen", offscreen_));
     }
-    if (isInvalid(universial_)) {
-        return "default";
+    if (hasUniversial_ && isInvalid(universial_)) {
+        errors.push_back(describe("default", universial_));
     }
     for (const auto &[name, rule] : rules_) {
         if (isInvalid(rule)) {
-            return name;
+            errors.push_back(describe(name, rule));
         }
     }
-
-    return {};
 }
 
 DynamicFps::FpsRule DynamicFps::GetCurrentRule(void) const {
