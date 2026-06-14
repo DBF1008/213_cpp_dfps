@@ -270,11 +270,22 @@ int ExecCmdSync(std::string *content, const char **argv) {
         return -1;
     }
 
-    int status;
-    waitpid(pid, &status, 0);
-    status = WEXITSTATUS(status);
-
+    // Drain the child's stdout/stderr BEFORE waitpid().
+    //
+    // The pipe buffer is limited (typically 64 KiB on Linux). If the child
+    // produces more output than that, its write() will block until the parent
+    // consumes some data. The previous implementation called waitpid() first
+    // and only then read from the pipe, so both sides waited forever whenever
+    // the output exceeded the buffer -- seen in the wild with e.g.
+    // `dumpsys activity` on some devices.
     if (content) {
+        // Defensive: ensure blocking reads even if ExecCmd ever switches to
+        // O_NONBLOCK pipes for its async callers.
+        int flags = fcntl(fd, F_GETFL, 0);
+        if (flags >= 0 && (flags & O_NONBLOCK)) {
+            fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+        }
+
         constexpr size_t READ_BATCH_SIZE = 4096;
         int len = 0;
         int l = 0;
@@ -282,8 +293,10 @@ int ExecCmdSync(std::string *content, const char **argv) {
         do {
             len += l;
             content->resize(len + READ_BATCH_SIZE);
-        } while ((l = read(fd, content->data() + len, READ_BATCH_SIZE)) > 0);
+            l = read(fd, content->data() + len, READ_BATCH_SIZE);
+        } while (l > 0);
         close(fd);
+        fd = -1;
 
         if (len > 0) {
             content->resize(len + 1);
@@ -291,6 +304,16 @@ int ExecCmdSync(std::string *content, const char **argv) {
         } else {
             content->clear();
         }
+    }
+
+    int status;
+    waitpid(pid, &status, 0);
+    status = WEXITSTATUS(status);
+
+    // Guard against a leaked fd if content was null but ExecCmd still created
+    // a pipe (should not happen given the current contract, but be safe).
+    if (fd >= 0) {
+        close(fd);
     }
 
     return status;
