@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "config_parser.h"
 #include "platform/module_base.h"
 #include "utils/time_counter.h"
 #include <map>
@@ -27,16 +28,7 @@ public:
     void Start(void);
 
 private:
-    struct FpsRule {
-        int idle;
-        int active;
-    };
-
     void LoadConfig(const std::string &configPath);
-    void ParseLine(const std::string &line);
-    void AddRule(const std::string &pkgName, FpsRule rule);
-    void SetTunable(const std::string &tunable, const std::string &value);
-    std::string FindInvalidRule(void);
     FpsRule GetCurrentRule(void) const;
 
     void AddReactor(void);

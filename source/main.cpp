@@ -24,6 +24,7 @@
 #include <spdlog/sinks/basic_file_sink.h>
 #include <spdlog/spdlog.h>
 
+#include "config_parser.h"
 #include "dfps.h"
 #include "utils/inotify.h"
 #include "utils/misc.h"
@@ -123,6 +124,16 @@ void KillOldApp(void) {
     }
 }
 
+bool ValidateConfig(void) {
+    try {
+        ParseConfigFile(configFile);
+        return true;
+    } catch (const std::exception &e) {
+        SPDLOG_ERROR("Config validation failed: {}", e.what());
+        return false;
+    }
+}
+
 void DaemonSigHandler(int signum) {
     pid_t child_pid;
     int status;
@@ -163,10 +174,15 @@ void Daemon(void) {
 
     for (;;) {
         inotify.WaitAndHandle();
-        SPDLOG_INFO("Config file updated, restart {} to load new config file", PROC_NAME);
-        KillOldApp();
-        Sleep(SToUs(0.5)); // wait finishing termination
-        StartNewApp();
+        SPDLOG_INFO("Config file updated, validating new config...");
+        if (ValidateConfig()) {
+            SPDLOG_INFO("Config is valid, restarting {} to load new config", PROC_NAME);
+            KillOldApp();
+            Sleep(SToUs(0.5)); // wait finishing termination
+            StartNewApp();
+        } else {
+            SPDLOG_ERROR("Bad config rejected, keeping current {} instance alive", PROC_NAME);
+        }
     }
 }
 
