@@ -25,6 +25,7 @@
 #include <spdlog/spdlog.h>
 
 #include "dfps.h"
+#include "modules/config_parser.h"
 #include "utils/inotify.h"
 #include "utils/misc.h"
 #include "utils/misc_android.h"
@@ -163,7 +164,17 @@ void Daemon(void) {
 
     for (;;) {
         inotify.WaitAndHandle();
-        SPDLOG_INFO("Config file updated, restart {} to load new config file", PROC_NAME);
+        SPDLOG_INFO("Config file updated, validate before reloading {}", PROC_NAME);
+        // Validate the new config before touching the running instance. A bad config
+        // (missing default/offscreen rule, invalid rule, parse error) must not take the
+        // service down: keep the current instance alive and wait for the next edit.
+        try {
+            ConfigParser::Validate(configFile);
+        } catch (const std::exception &e) {
+            SPDLOG_WARN("New config rejected ({}), keep current {} running", e.what(), PROC_NAME);
+            continue;
+        }
+        SPDLOG_INFO("New config is valid, reload {}", PROC_NAME);
         KillOldApp();
         Sleep(SToUs(0.5)); // wait finishing termination
         StartNewApp();
